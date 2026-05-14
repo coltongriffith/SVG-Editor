@@ -136,6 +136,8 @@
   #overlay-svg .rotate-handle { fill: var(--accent); stroke: #fff; stroke-width: 1.5; pointer-events: all; cursor: grab; }
   #overlay-svg .rotate-stem { stroke: #7c5cbf; stroke-width: 1; pointer-events: none; }
   #overlay-svg .rubber-band { fill: rgba(124,92,191,0.08); stroke: #7c5cbf; stroke-width: 1; stroke-dasharray: 4 3; pointer-events: none; }
+  #overlay-svg .group-border { fill: none; stroke: #f59e0b; stroke-width: 1.5; stroke-dasharray: 6 3; pointer-events: none; }
+  #group-mode-banner { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); background: #f59e0b; color: #fff; font-size: 12px; font-weight: 600; padding: 4px 14px; border-radius: 20px; z-index: 300; display: none; pointer-events: none; white-space: nowrap; }
 
   /* ── RIGHT PANEL ── */
   #right-panel {
@@ -344,6 +346,7 @@
 
   <!-- CANVAS AREA -->
   <div id="canvas-area" class="mode-select">
+    <div id="group-mode-banner">Inside group — Esc to exit</div>
     <div id="drop-overlay">
       <div id="drop-inner">
         <h2>SVG Editor</h2>
@@ -418,6 +421,7 @@ const state = {
   defaultColors: { fill: '#7c5cbf', stroke: '#5a3f9c' },
   layerHidden: new WeakMap(),  // el -> bool
   layerLocked: new WeakMap(),  // el -> bool
+  enteredGroup: null,          // <g> element currently "entered" for inner editing
 };
 
 // ═══════════════════════════════════════════════════
@@ -553,7 +557,7 @@ document.addEventListener('keydown', e => {
     if (key === 'h') selectTool('pan');
     if (key === 'g') toggleGrid();
     if (key === 'delete' || key === 'backspace') { e.preventDefault(); deleteSelected(); }
-    if (key === 'escape') clearSelection();
+    if (key === 'escape') { if (state.enteredGroup) exitGroup(); else clearSelection(); }
   }
   if (ctrl && key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
   if (ctrl && (key === 'y' || (key === 'z' && e.shiftKey))) { e.preventDefault(); redo(); }
@@ -776,8 +780,41 @@ function svgPointRaw(e) {
   return { x: (e.clientX - rect.left) / state.zoom, y: (e.clientY - rect.top) / state.zoom };
 }
 function getElBBox(el) {
-  try { const b = el.getBBox(); return { x: b.x, y: b.y, w: b.width, h: b.height }; }
-  catch { return { x: 0, y: 0, w: 0, h: 0 }; }
+  // For elements nested inside groups, getBBox() gives coords in parent's space.
+  // Use screen rect → mainSVG space conversion instead — always correct.
+  try {
+    if (!el.getBoundingClientRect || !mainSVG.getScreenCTM) {
+      const b = el.getBBox(); return { x: b.x, y: b.y, w: b.width, h: b.height };
+    }
+    return screenRectToSVG(el.getBoundingClientRect());
+  } catch { return { x: 0, y: 0, w: 0, h: 0 }; }
+}
+
+function screenRectToSVG(cr) {
+  try {
+    const inv = mainSVG.getScreenCTM().inverse();
+    const corners = [
+      {x: cr.left, y: cr.top}, {x: cr.right, y: cr.top},
+      {x: cr.left, y: cr.bottom}, {x: cr.right, y: cr.bottom}
+    ].map(pt => { const p = mainSVG.createSVGPoint(); p.x = pt.x; p.y = pt.y; return p.matrixTransform(inv); });
+    const xs = corners.map(c => c.x), ys = corners.map(c => c.y);
+    return { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs)-Math.min(...xs), h: Math.max(...ys)-Math.min(...ys) };
+  } catch { return { x: 0, y: 0, w: 0, h: 0 }; }
+}
+
+// Converts a drag delta in mainSVG coords to the element's parent's local coords.
+// Handles groups with scale/rotate transforms correctly.
+function localDeltaForEl(el, svgDx, svgDy) {
+  if (!el.parentElement || el.parentElement === mainSVG) return { x: svgDx, y: svgDy };
+  try {
+    const parentCTM = el.parentElement.getCTM();
+    const svgCTM    = mainSVG.getScreenCTM();
+    if (!parentCTM || !svgCTM) return { x: svgDx, y: svgDy };
+    const inv  = parentCTM.inverse();
+    const dx_vp = svgCTM.a * svgDx + svgCTM.c * svgDy;
+    const dy_vp = svgCTM.b * svgDx + svgCTM.d * svgDy;
+    return { x: inv.a * dx_vp + inv.c * dy_vp, y: inv.b * dx_vp + inv.d * dy_vp };
+  } catch { return { x: svgDx, y: svgDy }; }
 }
 
 // ═══════════════════════════════════════════════════
@@ -802,6 +839,29 @@ function clearSelection() {
   overlaySVG.innerHTML = '';
   renderPropsPanel(null);
   renderLayers();
+}
+
+function enterGroup(g) {
+  state.enteredGroup = g;
+  document.getElementById('group-mode-banner').style.display = 'block';
+  // Draw orange dashed border around the group
+  overlaySVG.innerHTML = '';
+  const bb = getElBBox(g);
+  const ns = 'http://www.w3.org/2000/svg';
+  const border = document.createElementNS(ns, 'rect');
+  border.setAttribute('x', bb.x - 4); border.setAttribute('y', bb.y - 4);
+  border.setAttribute('width', bb.w + 8); border.setAttribute('height', bb.h + 8);
+  border.setAttribute('class', 'group-border');
+  overlaySVG.appendChild(border);
+  renderPropsPanel(null);
+  toast('Inside group — click elements to select, Esc to exit');
+}
+
+function exitGroup() {
+  if (!state.enteredGroup) return;
+  state.enteredGroup = null;
+  document.getElementById('group-mode-banner').style.display = 'none';
+  clearSelection();
 }
 
 function selectElement(el) {
@@ -913,20 +973,23 @@ svgContainer.addEventListener('mousedown', e => {
   if (state.tool === 'text') { openTextDialog(e); return; }
 
   if (state.tool === 'select') {
+    // Determine which "parent container" we're navigating within
+    const container = state.enteredGroup || mainSVG;
+
     let target = e.target;
-    while (target && target.parentElement !== mainSVG) target = target.parentElement;
+    while (target && target.parentElement !== container) target = target.parentElement;
+
     if (!target || target === mainSVG || target === overlaySVG || target.id === '__grid_overlay') {
-      if (!e.shiftKey) {
-        clearSelection();
-        startRubberBand(e);
-      }
+      // Clicked outside the container — exit group if inside one
+      if (state.enteredGroup) { exitGroup(); return; }
+      if (!e.shiftKey) { clearSelection(); startRubberBand(e); }
       return;
     }
-    if (state.layerHidden.get(target)) return;
-    if (state.layerLocked.get(target)) { toast('Layer is locked'); return; }
 
-    if (e.shiftKey) {
-      // Toggle in multi-select
+    if (state.layerHidden.get(target)) return;
+    if (!state.enteredGroup && state.layerLocked.get(target)) { toast('Layer is locked'); return; }
+
+    if (e.shiftKey && !state.enteredGroup) {
       const idx = state.selectedEls.indexOf(target);
       if (idx >= 0) {
         state.selectedEls.splice(idx, 1);
@@ -935,21 +998,17 @@ svgContainer.addEventListener('mousedown', e => {
         state.selectedEls.push(target);
         state.selectedEl = target;
       }
-      if (state.selectedEls.length === 1) {
-        drawSelectionHandles(state.selectedEl);
-      } else if (state.selectedEls.length > 1) {
-        drawMultiSelectionHandles();
-      } else {
-        overlaySVG.innerHTML = '';
-      }
+      if (state.selectedEls.length === 1) drawSelectionHandles(state.selectedEl);
+      else if (state.selectedEls.length > 1) drawMultiSelectionHandles();
+      else overlaySVG.innerHTML = '';
       renderPropsPanel(state.selectedEl);
       renderLayers();
       return;
     }
 
     if (!state.selectedEls.includes(target)) {
-      state.selectedEls = [target];
       state.selectedEl = target;
+      state.selectedEls = [target];
       drawSelectionHandles(target);
       renderPropsPanel(target);
       renderLayers();
@@ -958,14 +1017,37 @@ svgContainer.addEventListener('mousedown', e => {
   }
 });
 
-// Double-click: inline text edit
+// Double-click: edit nested text OR enter a group
 svgContainer.addEventListener('dblclick', e => {
   if (state.tool !== 'select') return;
-  let target = e.target;
-  while (target && target.parentElement !== mainSVG) target = target.parentElement;
-  if (target && target.tagName === 'text') {
-    openTextEditDialog(target);
+  e.preventDefault();
+
+  // Walk up from the actual clicked element to find a <text>
+  let el = e.target;
+  while (el && el !== mainSVG && el !== svgContainer) {
+    if (el.tagName === 'text') {
+      // Select it (handles nested correctly) and open edit dialog
+      state.selectedEl = el;
+      state.selectedEls = [el];
+      drawSelectionHandles(el);
+      renderPropsPanel(el);
+      renderLayers();
+      openTextEditDialog(el);
+      return;
+    }
+    el = el.parentElement;
   }
+
+  // If we double-clicked on a <g> (direct child of mainSVG or of enteredGroup), enter it
+  let direct = e.target;
+  const parent = state.enteredGroup || mainSVG;
+  while (direct && direct.parentElement !== parent) direct = direct.parentElement;
+  if (direct && direct.tagName === 'g') {
+    enterGroup(direct);
+    return;
+  }
+
+  // Double-click on currently selected element: already handled above or no-op
 });
 
 function startDrag(e) {
@@ -976,9 +1058,12 @@ function startDrag(e) {
   const onMove = ev => {
     if (!state.dragging) return;
     const p = svgPointRaw(ev);
-    const dx = p.x - lastPt.x, dy = p.y - lastPt.y;
+    const svgDx = p.x - lastPt.x, svgDy = p.y - lastPt.y;
     lastPt = p;
-    state.selectedEls.forEach(el => moveElement(el, dx, dy));
+    state.selectedEls.forEach(el => {
+      const { x: ldx, y: ldy } = localDeltaForEl(el, svgDx, svgDy);
+      moveElement(el, ldx, ldy);
+    });
     if (state.selectedEls.length === 1) drawSelectionHandles(state.selectedEl);
     else drawMultiSelectionHandles();
     renderPropsPanel(state.selectedEl);
@@ -1394,6 +1479,29 @@ function bringForward(el)  { if (el && el.nextElementSibling) { el.parentNode.in
 function sendBackward(el)  { if (el && el.previousElementSibling) { el.parentNode.insertBefore(el, el.previousElementSibling); refreshAfterOrder(el); } }
 function refreshAfterOrder(el) { drawSelectionHandles(el); pushHistory(); renderLayers(); }
 
+// Unwrap a <g> group: move its children to mainSVG, baking the group's transform into each child
+function flattenGroup(g) {
+  if (!g || g.tagName !== 'g' || !mainSVG) return;
+  const groupTransform = g.getAttribute('transform') || '';
+  const children = [...g.children].filter(c => !['defs','title','desc'].includes(c.tagName));
+  if (!children.length) { g.remove(); pushHistory(); renderLayers(); clearSelection(); return; }
+
+  children.forEach(child => {
+    const childTransform = child.getAttribute('transform') || '';
+    // Compose: child's new transform = group's transform + child's old transform
+    const composed = [groupTransform, childTransform].filter(Boolean).join(' ').trim();
+    if (composed) child.setAttribute('transform', composed);
+    else child.removeAttribute('transform');
+    child.style.cursor = 'move';
+    mainSVG.insertBefore(child, g);
+  });
+  g.remove();
+  clearSelection();
+  pushHistory();
+  renderLayers();
+  toast(`Flattened ${children.length} elements`, 'success');
+}
+
 function alignElements(dir) {
   const els = state.selectedEls;
   if (els.length < 2) return;
@@ -1507,6 +1615,44 @@ function renderPropsPanel(el) {
   }
 
   const tag = el.tagName.toLowerCase();
+
+  // ── Group panel ──
+  if (tag === 'g') {
+    const bb = getElBBox(el);
+    const children = [...el.children].filter(c => !['defs','title','desc'].includes(c.tagName));
+    let html = `<div class="rp-section">
+      <div class="rp-title">Group</div>
+      <div class="rp-row"><span class="rp-label">Children</span><span style="font-size:13px;color:var(--text-muted)">${children.length} element${children.length!==1?'s':''}</span></div>
+      <div class="rp-row"><span class="rp-label">X</span><span style="font-size:13px;color:var(--text-muted)">${Math.round(bb.x)}</span>
+        <span class="rp-label" style="text-align:right;min-width:16px">Y</span><span style="font-size:13px;color:var(--text-muted)">${Math.round(bb.y)}</span></div>
+    </div>
+    <div class="rp-section">
+      <div class="rp-title">Opacity</div>
+      <div class="rp-row">
+        <input class="rp-range" id="prop-opacity" type="range" min="0" max="1" step="0.01" value="${parseFloat(getAttr(el,'opacity','1'))||1}">
+        <span class="rp-val" id="prop-opacity-val">${Math.round((parseFloat(getAttr(el,'opacity','1'))||1)*100)}%</span>
+      </div>
+    </div>
+    <div class="rp-section">
+      <div class="rp-title">Actions</div>
+      <button class="rp-btn" id="btn-enter-group">Enter Group (dbl-click)</button>
+      <button class="rp-btn" id="btn-flatten-group">Flatten Group (unwrap)</button>
+      <button class="rp-btn" id="btn-dup-rp">Duplicate</button>
+      <button class="rp-btn danger" id="btn-del-rp">Delete</button>
+    </div>
+    <div class="rp-section"><div class="rp-title">Layers</div><div id="layers-list"></div></div>`;
+    rightPanel.innerHTML = html;
+    renderLayers();
+    const bind = (id, ev, fn) => { const e2 = document.getElementById(id); if (e2) e2.addEventListener(ev, fn); };
+    bind('prop-opacity', 'input', ev => { el.setAttribute('opacity', ev.target.value); document.getElementById('prop-opacity-val').textContent = Math.round(ev.target.value*100)+'%'; });
+    bind('prop-opacity', 'change', () => pushHistory());
+    bind('btn-enter-group', 'click', () => enterGroup(el));
+    bind('btn-flatten-group', 'click', () => flattenGroup(el));
+    bind('btn-dup-rp', 'click', duplicateSelected);
+    bind('btn-del-rp', 'click', deleteSelected);
+    return;
+  }
+
   const isText = tag === 'text';
   const isLine = tag === 'line';
   const isImage = tag === 'image';
